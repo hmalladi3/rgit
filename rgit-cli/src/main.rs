@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use rgit_core::gitignore::GitignoreSet;
 use rgit_core::index::{Index, IndexEntry, Time};
 use rgit_core::object::{Blob, Commit, EntryMode, Object, ObjectId, ObjectKind, Signature};
 use rgit_core::refs::HeadState;
@@ -164,9 +165,10 @@ fn cmd_add(paths: Vec<PathBuf>) -> Result<()> {
         .work_dir()
         .ok_or_else(|| anyhow!("not in a work tree"))?
         .to_path_buf();
+    let ignores = GitignoreSet::load(&work_dir)?;
     let mut index = repo.read_index()?;
     for path in paths {
-        add_path(&repo, &work_dir, &cwd, &path, &mut index)?;
+        add_path(&repo, &work_dir, &cwd, &path, &ignores, &mut index)?;
     }
     repo.write_index(&index)?;
     Ok(())
@@ -177,6 +179,7 @@ fn add_path(
     work_dir: &Path,
     cwd: &Path,
     path: &Path,
+    ignores: &GitignoreSet,
     index: &mut Index,
 ) -> Result<()> {
     let abs = if path.is_absolute() {
@@ -193,18 +196,31 @@ fn add_path(
     let rel = abs
         .strip_prefix(&work_dir_canon)
         .map_err(|_| anyhow!("path outside work tree: {}", path.display()))?;
+    let rel_str = rel.to_string_lossy();
+    let rel_bytes_for_ignore = rel_str.as_bytes();
 
     let meta = std::fs::symlink_metadata(&abs)?;
     if meta.is_dir() {
-        // Recurse into directory.
+        // Honor gitignore for directory recursion: skip ignored dirs.
+        if !rel_bytes_for_ignore.is_empty()
+            && ignores.is_ignored(rel_bytes_for_ignore, true)
+        {
+            return Ok(());
+        }
         for entry in std::fs::read_dir(&abs)? {
             let entry = entry?;
             let name = entry.file_name();
             if name == ".git" {
                 continue;
             }
-            add_path(repo, work_dir, cwd, &entry.path(), index)?;
+            add_path(repo, work_dir, cwd, &entry.path(), ignores, index)?;
         }
+        return Ok(());
+    }
+    // File / symlink — skip if ignored.
+    if !rel_bytes_for_ignore.is_empty()
+        && ignores.is_ignored(rel_bytes_for_ignore, false)
+    {
         return Ok(());
     }
 
@@ -311,12 +327,28 @@ fn cmd_commit(message: &str) -> Result<()> {
 fn cmd_status() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repository::open(&cwd)?;
+    let work_dir = repo
+        .work_dir()
+        .ok_or_else(|| anyhow!("not in a work tree"))?
+        .to_path_buf();
+    let ignores = GitignoreSet::load(&work_dir)?;
     let status = repo.status()?;
-    if status.changes.is_empty() {
+
+    let mut filtered: Vec<&WorkdirChange> = Vec::with_capacity(status.changes.len());
+    for change in &status.changes {
+        if let WorkdirChange::Untracked(path) = change {
+            if ignores.is_ignored(path, false) {
+                continue;
+            }
+        }
+        filtered.push(change);
+    }
+
+    if filtered.is_empty() {
         println!("nothing to commit, working tree clean");
         return Ok(());
     }
-    for change in &status.changes {
+    for change in filtered {
         match change {
             WorkdirChange::Staged(p) => println!("staged:    {}", String::from_utf8_lossy(p)),
             WorkdirChange::Modified(p) => println!("modified:  {}", String::from_utf8_lossy(p)),
