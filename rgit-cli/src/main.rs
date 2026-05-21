@@ -118,6 +118,13 @@ enum Command {
         cached: bool,
         refs: Vec<String>,
     },
+    /// Clone a remote repository over HTTPS.
+    Clone {
+        /// HTTPS URL of the remote repository.
+        url: String,
+        /// Target directory. Defaults to the repo name from the URL.
+        target: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -144,7 +151,46 @@ fn main() -> Result<()> {
         Command::RevParse { name } => cmd_rev_parse(&name),
         Command::Merge { target } => cmd_merge(&target),
         Command::Diff { cached, refs } => cmd_diff(cached, &refs),
+        Command::Clone { url, target } => cmd_clone(&url, target.as_deref()),
     }
+}
+
+fn cmd_clone(url: &str, target: Option<&Path>) -> Result<()> {
+    let target = match target {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let last = url
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("repo");
+            let name = last.trim_end_matches(".git");
+            PathBuf::from(name)
+        }
+    };
+
+    if target.exists() && std::fs::read_dir(&target)?.next().is_some() {
+        return Err(anyhow!(
+            "target directory {} is not empty",
+            target.display()
+        ));
+    }
+
+    let creds = match (
+        std::env::var("RGIT_USERNAME").or_else(|_| std::env::var("GITHUB_USERNAME")),
+        std::env::var("RGIT_TOKEN").or_else(|_| std::env::var("GITHUB_TOKEN")),
+    ) {
+        (Ok(user), Ok(token)) => Some(TransportCredentials {
+            username: user,
+            token,
+        }),
+        _ => None,
+    };
+
+    println!("Cloning into '{}'...", target.display());
+    rgit_core::transport::clone_http(url, &target, creds.as_ref())?;
+    println!("Done.");
+    Ok(())
 }
 
 fn cmd_diff(cached: bool, refs: &[String]) -> Result<()> {

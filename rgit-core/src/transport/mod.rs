@@ -88,8 +88,9 @@ pub fn pkt_line_flush() -> &'static [u8] {
     b"0000"
 }
 
-/// Decode pkt-line packets from `bytes`, returning a list of payloads
-/// (excluding flush packets) and the number of bytes consumed.
+/// Decode pkt-line packets from `bytes`, returning a list of payloads.
+/// Skips flush packets (`0000`), v2 delimiter packets (`0001`), and v2
+/// response-end packets (`0002`) — those are stream markers, not data.
 // @spec TX-PKTLINE-003, TX-PKTLINE-004
 pub fn pkt_line_decode_all(bytes: &[u8]) -> Result<Vec<Vec<u8>>, TransportError> {
     let mut out = Vec::new();
@@ -99,7 +100,8 @@ pub fn pkt_line_decode_all(bytes: &[u8]) -> Result<Vec<Vec<u8>>, TransportError>
             std::str::from_utf8(&bytes[cursor..cursor + 4]).map_err(|_| TransportError::PktLine)?;
         let len = u32::from_str_radix(len_str, 16).map_err(|_| TransportError::PktLine)? as usize;
         cursor += 4;
-        if len == 0 {
+        // 0000 = flush, 0001 = delim (v2), 0002 = response-end (v2).
+        if len == 0 || len == 1 || len == 2 {
             continue;
         }
         if len < 4 || cursor + len - 4 > bytes.len() {
@@ -418,6 +420,256 @@ fn push_ssh(
     }
 
     parse_push_result(&response)
+}
+
+// ---------------------------------------------------------------------
+// Clone (Smart HTTP v2 fetch)
+// ---------------------------------------------------------------------
+
+/// Clone the repository at `url` into `target_dir`. Initializes a new
+/// repository, fetches HEAD plus reachable history, writes the received
+/// pack, sets up local refs, and checks out the default branch.
+///
+/// `creds` is optional. Public repos can be cloned anonymously; private
+/// repos need a PAT for HTTP Basic auth (same as `push`).
+pub fn clone_http(
+    url: &str,
+    target_dir: &std::path::Path,
+    creds: Option<&TransportCredentials>,
+) -> Result<Repository, TransportError> {
+    use crate::object::Object;
+
+    let refs = ls_refs_v2(url, creds)?;
+    let head_ref = refs
+        .iter()
+        .find(|r| r.name == "HEAD")
+        .ok_or_else(|| TransportError::Server("remote did not advertise HEAD".into()))?;
+    let head_id = head_ref.id;
+
+    // Public repos sometimes advertise HEAD pointing at a sha that's
+    // unborn (empty repo). Bail with a clear error in that case.
+    if head_id.is_zero() {
+        return Err(TransportError::Server(
+            "remote HEAD is unborn (empty repo); nothing to clone".into(),
+        ));
+    }
+
+    let pack_bytes = fetch_pack_v2(url, &[head_id], creds)?;
+
+    let repo = Repository::init(target_dir, false)
+        .map_err(|e| TransportError::Server(format!("init: {e}")))?;
+
+    // Write the received pack into the repository and build its index.
+    let pack_dir = target_dir.join(".git").join("objects").join("pack");
+    std::fs::create_dir_all(&pack_dir).map_err(TransportError::Io)?;
+    let temp_pack = pack_dir.join("rgit-incoming.pack");
+    std::fs::write(&temp_pack, &pack_bytes).map_err(TransportError::Io)?;
+    repo.import_pack(&temp_pack)
+        .map_err(|e| TransportError::Server(format!("import_pack: {e}")))?;
+
+    // Write every non-HEAD ref the server advertised.
+    for r in &refs {
+        if r.name == "HEAD" {
+            continue;
+        }
+        // Skip refs that aren't under a top-level namespace we recognize
+        // (e.g., refs/pull/…). v1 mirrors only branches and tags.
+        if !(r.name.starts_with("refs/heads/") || r.name.starts_with("refs/tags/")) {
+            continue;
+        }
+        repo.write_ref(&r.name, &r.id)
+            .map_err(|e| TransportError::Server(format!("write_ref {}: {e}", r.name)))?;
+    }
+
+    // Choose a HEAD: prefer a branch whose id matches the advertised HEAD.
+    let head_branch = refs
+        .iter()
+        .filter(|r| r.name.starts_with("refs/heads/") && r.id == head_id)
+        .map(|r| r.name.clone())
+        .min();
+    let repo = match head_branch {
+        Some(branch) => {
+            repo.set_head_symbolic(&branch)
+                .map_err(|e| TransportError::Server(format!("set HEAD: {e}")))?;
+            // Re-open so the packs list is repopulated cleanly. (The
+            // existing handle may not see the just-imported pack until
+            // `Repository::open` re-scans `.git/objects/pack/`.)
+            Repository::open(target_dir)
+                .map_err(|e| TransportError::Server(format!("reopen: {e}")))?
+        }
+        None => {
+            repo.set_head_detached(&head_id)
+                .map_err(|e| TransportError::Server(format!("set HEAD: {e}")))?;
+            Repository::open(target_dir)
+                .map_err(|e| TransportError::Server(format!("reopen: {e}")))?
+        }
+    };
+
+    // Check out HEAD's tree into the working tree.
+    let head_obj = repo.read_object(&head_id)?;
+    if let Object::Commit(commit) = head_obj {
+        let index = repo
+            .checkout(&commit.tree)
+            .map_err(|e| TransportError::Server(format!("checkout: {e}")))?;
+        repo.write_index(&index)
+            .map_err(|e| TransportError::Server(format!("write_index: {e}")))?;
+    }
+
+    Ok(repo)
+}
+
+fn ls_refs_v2(
+    url: &str,
+    creds: Option<&TransportCredentials>,
+) -> Result<Vec<RemoteRef>, TransportError> {
+    let post_url = format!("{}/git-upload-pack", url.trim_end_matches('/'));
+
+    // command=ls-refs   delim   peel\n   symrefs\n   ref-prefix refs/   flush
+    let mut body = Vec::new();
+    body.extend_from_slice(&pkt_line_encode(b"command=ls-refs\n"));
+    body.extend_from_slice(b"0001"); // delimiter
+    body.extend_from_slice(&pkt_line_encode(b"peel\n"));
+    body.extend_from_slice(&pkt_line_encode(b"symrefs\n"));
+    body.extend_from_slice(b"0000"); // flush
+
+    let mut req = ureq::post(&post_url)
+        .set("Content-Type", "application/x-git-upload-pack-request")
+        .set("Accept", "application/x-git-upload-pack-result")
+        .set("Git-Protocol", "version=2")
+        .set("User-Agent", "rgit/0.1.0");
+    if let Some(c) = creds {
+        req = req.set("Authorization", &auth_header(c));
+    }
+
+    let response = match req.send_bytes(&body) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(401, _)) => return Err(TransportError::AuthRequired),
+        Err(e) => return Err(TransportError::Http(e.to_string())),
+    };
+
+    let mut resp_bytes = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut resp_bytes)
+        .map_err(TransportError::Io)?;
+
+    parse_ls_refs_v2(&resp_bytes)
+}
+
+fn parse_ls_refs_v2(bytes: &[u8]) -> Result<Vec<RemoteRef>, TransportError> {
+    let pkts = pkt_line_decode_all(bytes)?;
+    let mut refs = Vec::new();
+    for pkt in pkts {
+        let line = if pkt.last() == Some(&b'\n') {
+            &pkt[..pkt.len() - 1]
+        } else {
+            &pkt[..]
+        };
+        if line.len() < 41 || line[40] != b' ' {
+            continue;
+        }
+        let hex = std::str::from_utf8(&line[..40]).map_err(|_| TransportError::PktLine)?;
+        let id = match ObjectId::from_hex(hex) {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        let rest = &line[41..];
+        // Ref name runs to either end-of-line or a space (attributes follow).
+        let name_end = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
+        let name = String::from_utf8_lossy(&rest[..name_end]).into_owned();
+        refs.push(RemoteRef { name, id });
+    }
+    Ok(refs)
+}
+
+fn fetch_pack_v2(
+    url: &str,
+    wants: &[ObjectId],
+    creds: Option<&TransportCredentials>,
+) -> Result<Vec<u8>, TransportError> {
+    let post_url = format!("{}/git-upload-pack", url.trim_end_matches('/'));
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&pkt_line_encode(b"command=fetch\n"));
+    body.extend_from_slice(b"0001"); // delimiter
+    body.extend_from_slice(&pkt_line_encode(b"no-progress\n"));
+    body.extend_from_slice(&pkt_line_encode(b"ofs-delta\n"));
+    for want in wants {
+        let line = format!("want {}\n", want.to_hex());
+        body.extend_from_slice(&pkt_line_encode(line.as_bytes()));
+    }
+    body.extend_from_slice(&pkt_line_encode(b"done\n"));
+    body.extend_from_slice(b"0000"); // flush
+
+    let mut req = ureq::post(&post_url)
+        .set("Content-Type", "application/x-git-upload-pack-request")
+        .set("Accept", "application/x-git-upload-pack-result")
+        .set("Git-Protocol", "version=2")
+        .set("User-Agent", "rgit/0.1.0");
+    if let Some(c) = creds {
+        req = req.set("Authorization", &auth_header(c));
+    }
+
+    let response = match req.send_bytes(&body) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(401, _)) => return Err(TransportError::AuthRequired),
+        Err(e) => return Err(TransportError::Http(e.to_string())),
+    };
+
+    let mut resp_bytes = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut resp_bytes)
+        .map_err(TransportError::Io)?;
+
+    extract_pack_from_v2_fetch(&resp_bytes)
+}
+
+/// Pull the packfile bytes out of a v2 fetch response. The response is
+/// a sequence of pkt-lines: optionally an acknowledgments section,
+/// optionally a "packfile" marker, then sideband-prefixed pkt-lines
+/// where byte 1 = pack data, 2 = progress, 3 = error.
+fn extract_pack_from_v2_fetch(bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
+    let pkts = pkt_line_decode_all(bytes)?;
+    let mut in_packfile = false;
+    let mut pack = Vec::new();
+    for pkt in pkts {
+        if !in_packfile {
+            // "packfile" marker line (possibly with trailing LF).
+            let trimmed = if pkt.last() == Some(&b'\n') {
+                &pkt[..pkt.len() - 1]
+            } else {
+                &pkt[..]
+            };
+            if trimmed == b"packfile" {
+                in_packfile = true;
+            }
+            continue;
+        }
+        if pkt.is_empty() {
+            continue;
+        }
+        match pkt[0] {
+            1 => pack.extend_from_slice(&pkt[1..]),
+            2 => { /* progress channel, swallow */ }
+            3 => {
+                return Err(TransportError::Server(
+                    String::from_utf8_lossy(&pkt[1..]).trim().to_string(),
+                ))
+            }
+            other => {
+                return Err(TransportError::Server(format!(
+                    "unexpected sideband channel: {other}",
+                )))
+            }
+        }
+    }
+    if pack.is_empty() {
+        return Err(TransportError::Server(
+            "fetch response contained no packfile".into(),
+        ));
+    }
+    Ok(pack)
 }
 
 /// Read a stream of pkt-line ref entries from the SSH stdout until a
