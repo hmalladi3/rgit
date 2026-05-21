@@ -4,6 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use rgit_core::gitignore::GitignoreSet;
 use rgit_core::index::{Index, IndexEntry, Time};
+use rgit_core::merge::MergeResult;
 use rgit_core::object::{Blob, Commit, EntryMode, Object, ObjectId, ObjectKind, Signature};
 use rgit_core::refs::HeadState;
 use rgit_core::transport::{list_remote_refs, push, RefUpdate, TransportCredentials};
@@ -103,6 +104,10 @@ enum Command {
     },
     /// Resolve a ref name or short id to a full 40-char SHA.
     RevParse { name: String },
+    /// Fast-forward HEAD to `target` (a branch or commit). Errors if
+    /// the merge would not be fast-forward; full three-way merge is
+    /// deferred.
+    Merge { target: String },
 }
 
 fn main() -> Result<()> {
@@ -127,7 +132,23 @@ fn main() -> Result<()> {
         Command::Show { target } => cmd_show(target.as_deref()),
         Command::LsTree { target } => cmd_ls_tree(&target),
         Command::RevParse { name } => cmd_rev_parse(&name),
+        Command::Merge { target } => cmd_merge(&target),
     }
+}
+
+fn cmd_merge(target: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo = Repository::open(&cwd)?;
+    let target_id = resolve_ref_or_id(&repo, target)?;
+    match repo.merge_fast_forward(&target_id)? {
+        MergeResult::UpToDate => println!("Already up to date."),
+        MergeResult::FastForwarded { from, to } => println!(
+            "Fast-forwarded from {} to {}",
+            &from.to_hex()[..7],
+            &to.to_hex()[..7],
+        ),
+    }
+    Ok(())
 }
 
 /// Resolve a ref name, short id, or full SHA to an `ObjectId`.
