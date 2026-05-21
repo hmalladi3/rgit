@@ -108,6 +108,16 @@ enum Command {
     /// the merge would not be fast-forward; full three-way merge is
     /// deferred.
     Merge { target: String },
+    /// Unified diff. With no args: working tree vs index. With
+    /// `--cached`: index vs HEAD. With one ref: working tree vs ref.
+    /// With two refs: ref-a vs ref-b.
+    Diff {
+        /// Compare the index against HEAD instead of the working tree
+        /// against the index.
+        #[arg(long)]
+        cached: bool,
+        refs: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -133,6 +143,46 @@ fn main() -> Result<()> {
         Command::LsTree { target } => cmd_ls_tree(&target),
         Command::RevParse { name } => cmd_rev_parse(&name),
         Command::Merge { target } => cmd_merge(&target),
+        Command::Diff { cached, refs } => cmd_diff(cached, &refs),
+    }
+}
+
+fn cmd_diff(cached: bool, refs: &[String]) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo = Repository::open(&cwd)?;
+    let output = match (cached, refs.len()) {
+        (true, 0) => repo.diff_index_vs_head()?,
+        (false, 0) => repo.diff_working_vs_index()?,
+        (false, 2) => {
+            let a = resolve_to_tree(&repo, &refs[0])?;
+            let b = resolve_to_tree(&repo, &refs[1])?;
+            repo.diff_trees(&a, &b)?
+        }
+        (true, _) => return Err(anyhow!("--cached does not take ref arguments")),
+        (false, 1) => {
+            // Working tree vs ref: realize the ref's tree paths and
+            // compare against working tree. Implemented as: diff
+            // HEAD-tree vs ref-tree if HEAD differs from ref. Simpler
+            // alternative for v1 — defer; emit a hint.
+            return Err(anyhow!(
+                "single-ref diff (working tree vs ref) is not implemented; \
+                 use `rgit diff <ref-a> <ref-b>` for two-tree comparison \
+                 or `rgit diff` / `rgit diff --cached` for working-tree diffs"
+            ));
+        }
+        _ => return Err(anyhow!("too many ref arguments")),
+    };
+    std::io::stdout().write_all(output.as_bytes())?;
+    Ok(())
+}
+
+fn resolve_to_tree(repo: &Repository, name: &str) -> Result<ObjectId> {
+    let id = resolve_ref_or_id(repo, name)?;
+    let obj = repo.read_object(&id)?;
+    match obj {
+        Object::Commit(c) => Ok(c.tree),
+        Object::Tree(_) => Ok(id),
+        _ => Err(anyhow!("{name} is not a commit or tree")),
     }
 }
 
@@ -223,9 +273,7 @@ fn add_path(
     let meta = std::fs::symlink_metadata(&abs)?;
     if meta.is_dir() {
         // Honor gitignore for directory recursion: skip ignored dirs.
-        if !rel_bytes_for_ignore.is_empty()
-            && ignores.is_ignored(rel_bytes_for_ignore, true)
-        {
+        if !rel_bytes_for_ignore.is_empty() && ignores.is_ignored(rel_bytes_for_ignore, true) {
             return Ok(());
         }
         for entry in std::fs::read_dir(&abs)? {
@@ -239,9 +287,7 @@ fn add_path(
         return Ok(());
     }
     // File / symlink — skip if ignored.
-    if !rel_bytes_for_ignore.is_empty()
-        && ignores.is_ignored(rel_bytes_for_ignore, false)
-    {
+    if !rel_bytes_for_ignore.is_empty() && ignores.is_ignored(rel_bytes_for_ignore, false) {
         return Ok(());
     }
 

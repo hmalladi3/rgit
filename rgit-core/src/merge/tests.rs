@@ -10,12 +10,7 @@ fn make_repo() -> (TempDir, Repository) {
     (dir, repo)
 }
 
-fn write_commit(
-    repo: &Repository,
-    tree: ObjectId,
-    parents: Vec<ObjectId>,
-    msg: &[u8],
-) -> ObjectId {
+fn write_commit(repo: &Repository, tree: ObjectId, parents: Vec<ObjectId>, msg: &[u8]) -> ObjectId {
     let sig = Signature {
         raw: b"t <t@e.com> 1700000000 +0000".to_vec(),
         name: Some(b"t".to_vec()),

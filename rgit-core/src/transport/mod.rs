@@ -260,10 +260,7 @@ fn push_http(
 
 /// Build the receive-pack request body: pkt-line ref-update commands,
 /// flush packet, raw pack bytes. Same for HTTP and SSH transports.
-fn build_push_body(
-    repo: &Repository,
-    updates: &[RefUpdate],
-) -> Result<Vec<u8>, TransportError> {
+fn build_push_body(repo: &Repository, updates: &[RefUpdate]) -> Result<Vec<u8>, TransportError> {
     let mut ids: HashSet<ObjectId> = HashSet::new();
     for update in updates {
         if update.new_id.is_zero() {
@@ -332,9 +329,9 @@ fn parse_ssh_url(url: &str) -> Result<SshUrl, TransportError> {
             });
         }
     }
-    Err(TransportError::Http(format!(
-        "unrecognized ssh url: {url}",
-    )))
+    Err(TransportError::Http(
+        format!("unrecognized ssh url: {url}",),
+    ))
 }
 
 fn push_ssh(
@@ -387,10 +384,7 @@ fn push_ssh(
 
     // If everything's already up to date, send a no-op flush so the
     // server closes cleanly, then return.
-    if resolved_updates
-        .iter()
-        .all(|u| u.old_id == u.new_id)
-    {
+    if resolved_updates.iter().all(|u| u.old_id == u.new_id) {
         stdin
             .write_all(pkt_line_flush())
             .map_err(TransportError::Io)?;
