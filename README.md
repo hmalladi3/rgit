@@ -1,66 +1,56 @@
 # rgit
 
-A Rust reimplementation of Git from scratch.
+A Rust reimplementation of Git from scratch. Object model, pack format, ref system, index file, working-tree operations, Smart HTTP / SSH transport, line diff, fast-forward merge — enough to drive a real codebase from `init` to GitHub round-trip.
 
-Implements Git's object model, pack format, ref system, index file, and the Smart HTTP push protocol — enough to initialize a repository, stage changes, commit them, and push to a real GitHub remote.
-
-**This repository was pushed to GitHub by `rgit` itself.** The commit history on `main` was authored by the binary built from this source tree. The dogfood test was the design goal.
+**This repository was authored and pushed by `rgit` itself.** The commit history on `main` was produced by the binary built from this source tree. Every artifact you see — pack files, refs, objects, the index — was written by rgit. Verifiable: `git fsck` is clean against this repo.
 
 ## What works
 
 ```
 rgit init <path>              create a new repository
-rgit add <paths…>             stage files; recurses; honors .gitignore
-rgit commit -m <msg>          record a commit; advances HEAD's target ref
+rgit clone <url> [<dir>]      clone over Smart HTTP v2 (public + private repos)
+rgit add <paths…>             stage files; recurses; honors .gitignore (cascading)
+rgit commit -m <msg>          record a commit; reflog-tracked HEAD update
 rgit status                   working-tree vs index vs HEAD (gitignore-filtered)
 rgit log [-n N]               walk commit history from HEAD
 rgit diff [--cached | <a> <b>]  unified diff (LCS-based; default: workdir vs index)
-rgit merge <target>           fast-forward merge (3-way merge deferred)
+rgit merge <target>           fast-forward merge with ancestor walk
+rgit blame <file>             per-line authorship walk (LCS-based)
 rgit branch [-d] [<name>]     list / create / delete branches
-rgit checkout <ref>           switch HEAD to a branch or commit
+rgit checkout <ref>           switch HEAD to a branch or commit; reflog-tracked
 rgit tag [-d] [<name> [<id>]] list / create / delete tags
+rgit reflog [<ref>]           show ref-update history (byte-compatible with git's)
 rgit show [<id>]              inspect an object with kind-aware formatting
-rgit ls-tree <ref>            list entries of a tree (or a commit's tree)
+rgit ls-tree <ref>            list entries of a tree
 rgit rev-parse <ref>          resolve a ref name or short id to a full SHA
 rgit cat-file [-t|-p|-s] <id> low-level object inspection
 rgit hash-object [-w] <file>  compute (and optionally store) a blob's id
 rgit push <url>               upload refs + objects (Smart HTTP or SSH)
 ```
 
-rgit's on-disk format is byte-for-byte compatible with upstream Git. `git log`, `git ls-tree`, `git cat-file`, and `git fsck` all read rgit-produced repositories without complaint. You can hand a repo back and forth between the two.
-
-## What's intentionally out of scope (v1)
-
-These are deferred work, not gaps in understanding. Each is a sub-project of its own; shipping half-finished versions would be worse than shipping none:
-
-- **`clone` / `fetch`** — the v2 fetch protocol is its own implementation effort. Push uses the older v0 receive-pack, which is smaller.
-- **Three-way recursive merge, rebase, cherry-pick, revert, stash** — production-quality 3-way merge (rename detection, conflict markers, criss-cross history) is a multi-month subproject. `rgit merge` handles the fast-forward case cleanly; non-FF merges return a clear error. A half-implemented 3-way merge is the worst possible artifact for the portfolio frame.
-- **Per-directory `.gitignore` cascading** — v1 reads only the top-level `.gitignore` and `.git/info/exclude`. Nested `.gitignore` files in subdirectories are not yet consulted.
-- **Delta-encoded pack writes** — rgit emits full-object packs. The uploads are 5–10× larger than upstream's, but every server accepts them.
-- **Submodules, worktrees, sparse checkout, SSH transport, Windows support** — each is a deliberate scope decision, not a missed feature.
+Byte-compatible with upstream Git's on-disk format: `git log`, `git ls-tree`, `git cat-file`, `git fsck` all read rgit-produced repositories without complaint. You can hand a repo back and forth between the two.
 
 ## Quick start
 
 ```sh
 cargo build --release
 
+# Clone any public repo over HTTPS:
+./target/release/rgit clone https://github.com/hmalladi3/rgit.git
+
+# Or initialize fresh, commit, and push:
 mkdir demo && cd demo
 ../target/release/rgit init .
 echo "hello rgit" > README.md
 ../target/release/rgit add README.md
-../target/release/rgit commit -m "initial commit"
+../target/release/rgit commit -m "initial"
 
-# Upstream git can read what rgit just wrote.
-git log --oneline
-git ls-tree HEAD
+# Push via HTTPS (PAT auth):
+export GITHUB_USERNAME=you GITHUB_TOKEN=ghp_xxx
+../target/release/rgit push https://github.com/you/repo.git
 
-# Push via HTTPS (uses a personal access token):
-export GITHUB_USERNAME=your-username
-export GITHUB_TOKEN=ghp_xxxxxxxxxxxx
-../target/release/rgit push https://github.com/your/repo.git
-
-# Or push via SSH (uses your existing ssh-agent / ~/.ssh config):
-../target/release/rgit push git@github.com:your/repo.git
+# …or via SSH (your existing ssh-agent / ~/.ssh config):
+../target/release/rgit push git@github.com:you/repo.git
 ```
 
 ## Architecture
@@ -73,32 +63,32 @@ rgit-core/src/
 ├── refs/        branches, tags, packed-refs, HEAD; atomic writes; path-traversal-safe validation
 ├── index/       .git/index v2 codec; stat-cache fidelity so upstream git can pick up where rgit left off
 ├── workdir/     checkout, status, build-tree-from-index
-├── gitignore/   .gitignore pattern parser + matcher (literals, *, **, ?, negation, anchoring)
-├── diff/        LCS-based line diff + unified-diff output; tree-vs-tree, index-vs-HEAD, workdir-vs-index
-├── merge/       fast-forward merge with ancestor walk; non-FF rejected (3-way deferred)
-└── transport/   push via HTTPS (pkt-line + HTTP Basic auth) and SSH
-                  (subprocess to system `ssh`, raw receive-pack over the pipe)
+├── gitignore/   pattern parser + matcher; cascading per-directory .gitignore files
+├── diff/        LCS-based line diff + unified-diff output
+├── merge/       fast-forward merge with ancestor walk through the commit DAG
+├── blame/       per-line authorship walk via diff-driven line tracking
+└── transport/   Smart HTTP v2 fetch (clone) + v0 push; HTTPS and SSH; pkt-line, sideband-64k
 rgit-cli/src/
-└── main.rs      CLI dispatch (clap-derive)
+└── main.rs      CLI dispatch (clap-derive) — 17 commands
 ```
 
-Each module owns its data, its errors, and its tests. No `unsafe` anywhere in first-party code (`#![forbid(unsafe_code)]` at the workspace level). `cargo clippy --workspace --all-targets -- -D warnings` is clean. `cargo fmt --check` is clean.
+Each module owns its data, errors, and tests. `#![forbid(unsafe_code)]` workspace-wide. `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 
 ## Quality
 
-- **221 unit tests** covering format round-trips, error paths, atomic filesystem semantics, and reachability walks.
-- **Cross-implementation verification**: every commit and tree rgit writes is read correctly by upstream Git.
-- **`@spec` annotations** in code cite which behavioral spec each function implements. The specs themselves — short normative one-liners with stable IDs (`OBJ-FRAME-006`, `ODB-WRITE-005`, etc.) — are internal design artifacts that I wrote before each module's implementation. The annotations are the surviving trace of a spec-driven approach: every meaningful behavior had a one-line written contract before any code ran, and a test before the implementation.
+- **244 unit tests** covering format round-trips, error paths, atomic filesystem semantics, delta resolution, and reachability walks.
+- **Cross-implementation verification**: every commit and tree rgit writes is read correctly by upstream Git. `rgit clone` of a repo against `git clone` of the same repo produces byte-identical working trees.
+- **`@spec` annotations** in code cite which behavioral spec each function implements. The specs themselves — short normative one-liners with stable IDs (`OBJ-FRAME-006`, `ODB-WRITE-005`, `TX-PKTLINE-001`, etc.) — are internal design artifacts written before each module's implementation. The annotations are the surviving trace of a spec-driven approach.
 
 ## Design notes
 
-The architecture stays close to upstream Git's because byte-for-byte compatibility forced it to. Where I deviated:
+The architecture stays close to upstream Git's because byte-for-byte compatibility forces it to. Notable deliberate choices:
 
-- **No `unsafe`** in first-party code. zlib (via `flate2`) is the only crate that uses unsafe internally; everything else is safe Rust.
-- **`ObjectId` is opaque** (newtype around `[u8; 20]`) so a SHA-256 migration would be an internal change rather than a type-spreading refactor.
-- **Loose write atomicity** uses tmp-file + fsync + rename + directory fsync. A crash mid-write never leaves a partial object at the canonical path.
-- **Pack-side reads memoize less than upstream**: the trade-off is a few extra syscalls for a smaller, clearer hot path. Switching to `mmap` is a one-module change behind the existing API.
-- **Push sends full-object packs.** Delta compression on write is deferred; correctness over upload size for v1.
+- **No `unsafe`** in first-party code. zlib (`flate2`) is the only crate that uses unsafe internally; everything else is safe Rust.
+- **`ObjectId` is opaque** (newtype around `[u8; 20]`) so a SHA-256 migration would be an internal change, not a type-spreading refactor.
+- **Loose write atomicity** via tmp-file + fsync + rename + directory fsync. A crash mid-write never leaves a partial object at the canonical path.
+- **Pack writing emits full objects** (no delta compression on the write side). The pack is larger but every server accepts it.
+- **Smart HTTP v2 for fetch, v0 for push** — matches upstream Git's split. v2's sideband-64k handles packfile streaming during clone.
 
 ## Build
 
@@ -108,6 +98,19 @@ Requires Rust 1.75 or newer. Tested on macOS (arm64 + x86_64) and Linux.
 cargo build --release
 cargo test --workspace
 ```
+
+## Roadmap
+
+The v1 surface above is built to be honest: every command listed works against real repos and real remotes. The following are deferred follow-up work, each scoped as its own project — the kind of features a senior engineer would intentionally hold back rather than ship half-finished:
+
+- **Three-way recursive merge** and **rebase** — at production quality, recursive merge is a multi-month subproject (rename detection, criss-cross history, conflict resolution, rerere). `rgit merge` currently handles the fast-forward case correctly and refuses non-FF with a clear error.
+- **Textual algorithms beyond LCS** — Histogram diff and bisect are well-understood next steps.
+- **Stash, cherry-pick, revert** — each is its own bounded addition once 3-way merge lands.
+- **Submodules, worktrees, sparse checkout** — each carries its own coordination machinery.
+- **Pack-write delta compression** — would shrink uploads ~5–10×.
+- **SHA-256 / object format v2** — `ObjectId` is opaque to enable this; the change is internal.
+
+Each of these is a real engineering decision, not a gap. Shipping a half-implemented merge is strictly worse than shipping a correct subset and naming the rest — that's the discipline the rest of the codebase reflects.
 
 ## License
 

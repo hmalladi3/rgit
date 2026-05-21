@@ -125,6 +125,10 @@ enum Command {
         /// Target directory. Defaults to the repo name from the URL.
         target: Option<PathBuf>,
     },
+    /// Show the reflog for a ref (defaults to HEAD).
+    Reflog { ref_name: Option<String> },
+    /// Show line-by-line authorship for a file.
+    Blame { path: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -152,7 +156,69 @@ fn main() -> Result<()> {
         Command::Merge { target } => cmd_merge(&target),
         Command::Diff { cached, refs } => cmd_diff(cached, &refs),
         Command::Clone { url, target } => cmd_clone(&url, target.as_deref()),
+        Command::Reflog { ref_name } => cmd_reflog(ref_name.as_deref()),
+        Command::Blame { path } => cmd_blame(&path),
     }
+}
+
+fn cmd_blame(path: &Path) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo = Repository::open(&cwd)?;
+    let work_dir = repo
+        .work_dir()
+        .ok_or_else(|| anyhow!("not in a work tree"))?
+        .to_path_buf();
+    // Normalize path to repo-relative.
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let abs = abs
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", abs.display()))?;
+    let work_dir_canon = work_dir
+        .canonicalize()
+        .unwrap_or_else(|_| work_dir.to_path_buf());
+    let rel = abs
+        .strip_prefix(&work_dir_canon)
+        .map_err(|_| anyhow!("path outside work tree: {}", path.display()))?;
+    let rel_str = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+
+    let head_id = repo.read_ref("HEAD")?;
+    let lines = repo.blame(&rel_str, &head_id)?;
+    for (i, bl) in lines.iter().enumerate() {
+        let line_text = String::from_utf8_lossy(&bl.line);
+        let trimmed = line_text.trim_end_matches('\n');
+        println!("{} ({:>4}) {trimmed}", &bl.commit.to_hex()[..7], i + 1,);
+    }
+    Ok(())
+}
+
+fn cmd_reflog(ref_name: Option<&str>) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo = Repository::open(&cwd)?;
+    let ref_name = ref_name.unwrap_or("HEAD");
+    let entries = repo.read_reflog(ref_name)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    // Newest first.
+    for (rev_idx, entry) in entries.iter().rev().enumerate() {
+        let short = if entry.new_id == ObjectId::ZERO {
+            "0000000".to_string()
+        } else {
+            entry.new_id.to_hex()[..7].to_string()
+        };
+        println!(
+            "{short} {ref_name}@{{{idx}}}: {reason}",
+            idx = rev_idx,
+            reason = entry.reason,
+        );
+    }
+    Ok(())
 }
 
 fn cmd_clone(url: &str, target: Option<&Path>) -> Result<()> {
@@ -419,9 +485,10 @@ fn cmd_commit(message: &str) -> Result<()> {
     };
     let commit_id = repo.write_object(&Object::Commit(commit))?;
 
+    let summary = message.lines().next().unwrap_or("").to_string();
     match repo.read_head()? {
         HeadState::Symbolic(target) => {
-            repo.write_ref(&target, &commit_id)?;
+            repo.write_ref_with_reason(&target, &commit_id, &format!("commit: {summary}"))?;
             println!(
                 "[{} {}] {}",
                 target.strip_prefix("refs/heads/").unwrap_or(&target),

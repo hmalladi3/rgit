@@ -10,11 +10,15 @@ mod tests;
 use std::fs;
 use std::path::Path;
 
-/// A set of gitignore rules. Later rules can override earlier rules
-/// (via `!` negation).
+/// A set of gitignore rules from one or more `.gitignore` files. Each
+/// per-file rule set is tagged with the directory it lives in;
+/// matching against a path applies only the rule sets whose directory
+/// is an ancestor of (or identical to) the path's parent.
 #[derive(Debug, Default, Clone)]
 pub struct GitignoreSet {
-    rules: Vec<Rule>,
+    /// Each entry: `(dir_prefix relative to repo root using '/' separators, rules)`.
+    /// The root `.gitignore` and `.git/info/exclude` use the empty prefix.
+    sets: Vec<(Vec<u8>, Vec<Rule>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,25 +37,36 @@ impl GitignoreSet {
         Self::default()
     }
 
-    /// Load rules from `<repo_root>/.gitignore` and
-    /// `<repo_root>/.git/info/exclude` (both optional).
+    /// Load rules from every `.gitignore` file under `repo_root` (plus
+    /// `<repo_root>/.git/info/exclude`). Per-directory `.gitignore`
+    /// files cascade: rules in `subdir/.gitignore` apply only to paths
+    /// under `subdir/`.
     pub fn load(repo_root: &Path) -> std::io::Result<Self> {
         let mut set = Self::new();
+        // Root .gitignore + .git/info/exclude (both have empty prefix).
         for path in [
             repo_root.join(".gitignore"),
             repo_root.join(".git").join("info").join("exclude"),
         ] {
             match fs::read_to_string(&path) {
-                Ok(contents) => set.add_rules(&contents),
+                Ok(contents) => set.add_rules_with_prefix(b"", &contents),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             }
         }
+        // Walk subdirectories looking for nested .gitignore files.
+        // (Skip .git/ to avoid recursing into our own metadata.)
+        load_nested_gitignores(repo_root, repo_root, &mut set)?;
         Ok(set)
     }
 
-    /// Parse and append rules from gitignore-formatted text.
+    /// Parse and append rules from gitignore-formatted text with an
+    /// empty base prefix (legacy single-directory mode).
     pub fn add_rules(&mut self, content: &str) {
+        self.add_rules_with_prefix(b"", content);
+    }
+
+    fn add_rules_with_prefix(&mut self, prefix: &[u8], content: &str) {
         for raw_line in content.lines() {
             let line = raw_line.trim_end_matches('\r');
             if line.is_empty() || line.starts_with('#') {
@@ -85,13 +100,27 @@ impl GitignoreSet {
             if pattern.is_empty() {
                 continue;
             }
-            self.rules.push(Rule {
-                pattern,
-                negate,
-                dir_only,
-                anchored,
-            });
+            self.upsert_rule(
+                prefix,
+                Rule {
+                    pattern,
+                    negate,
+                    dir_only,
+                    anchored,
+                },
+            );
         }
+    }
+
+    fn upsert_rule(&mut self, prefix: &[u8], rule: Rule) {
+        // Append to the existing rule set for this prefix, or create one.
+        for (p, rules) in &mut self.sets {
+            if p == prefix {
+                rules.push(rule);
+                return;
+            }
+        }
+        self.sets.push((prefix.to_vec(), vec![rule]));
     }
 
     /// Test whether `path` (a byte-slice relative path with `/` separators)
@@ -102,13 +131,73 @@ impl GitignoreSet {
     /// ancestor directory of `path` matches a rule, the file is too.
     pub fn is_ignored(&self, path: &[u8], is_dir: bool) -> bool {
         let mut ignored = false;
-        for rule in &self.rules {
-            if rule.matches_self_or_ancestor(path, is_dir) {
-                ignored = !rule.negate;
+        for (prefix, rules) in &self.sets {
+            // A rule set with prefix `p` only applies to paths under `p/`.
+            // Compute the path's location relative to `p`.
+            let relative = match relative_to_prefix(path, prefix) {
+                Some(r) => r,
+                None => continue,
+            };
+            for rule in rules {
+                if rule.matches_self_or_ancestor(relative, is_dir) {
+                    ignored = !rule.negate;
+                }
             }
         }
         ignored
     }
+}
+
+/// Compute `path` relative to `prefix`. Returns `None` when `prefix` is
+/// not an ancestor directory of `path`. Empty prefix matches anything.
+fn relative_to_prefix<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    if prefix.is_empty() {
+        return Some(path);
+    }
+    if !path.starts_with(prefix) {
+        return None;
+    }
+    if path.len() == prefix.len() {
+        // path is the prefix dir itself; nested rules don't apply to it.
+        return None;
+    }
+    if path[prefix.len()] != b'/' {
+        return None;
+    }
+    Some(&path[prefix.len() + 1..])
+}
+
+fn load_nested_gitignores(
+    repo_root: &Path,
+    current: &Path,
+    set: &mut GitignoreSet,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        if name == ".git" {
+            continue;
+        }
+        let dir = entry.path();
+        let gitignore = dir.join(".gitignore");
+        if let Ok(contents) = fs::read_to_string(&gitignore) {
+            let rel = match dir.strip_prefix(repo_root) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let prefix = rel
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+                .into_bytes();
+            set.add_rules_with_prefix(&prefix, &contents);
+        }
+        load_nested_gitignores(repo_root, &dir, set)?;
+    }
+    Ok(())
 }
 
 impl Rule {

@@ -68,6 +68,24 @@ fn unanchored_pattern_matches_at_any_depth() {
 }
 
 #[test]
+fn nested_gitignore_applies_only_under_its_directory() {
+    use tempfile::TempDir;
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join(".gitignore"), "root.tmp\n").unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join(".gitignore"), "*.log\n").unwrap();
+
+    let set = GitignoreSet::load(dir.path()).unwrap();
+    // Root rule applies anywhere.
+    assert!(set.is_ignored(b"root.tmp", false));
+    assert!(set.is_ignored(b"sub/root.tmp", false));
+    // Nested rule applies only under sub/.
+    assert!(set.is_ignored(b"sub/app.log", false));
+    assert!(!set.is_ignored(b"app.log", false));
+}
+
+#[test]
 fn typical_rust_ignores() {
     let rules = "\
 # Build artifacts
