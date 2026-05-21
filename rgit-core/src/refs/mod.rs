@@ -27,6 +27,21 @@ pub enum HeadState {
     Detached(ObjectId),
 }
 
+/// One line of a reflog file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflogEntry {
+    pub old_id: ObjectId,
+    pub new_id: ObjectId,
+    /// `Name <email>` of the committer who made the change.
+    pub committer: String,
+    /// Unix timestamp.
+    pub timestamp: i64,
+    /// `+HHMM` timezone offset.
+    pub timezone: String,
+    /// Free-form reason (e.g., `commit: my message`).
+    pub reason: String,
+}
+
 /// Errors returned by the refs module.
 #[derive(Debug, Error)]
 pub enum RefError {
@@ -117,7 +132,18 @@ impl Repository {
     // @spec REFS-WRITE-001, REFS-WRITE-002, REFS-WRITE-003, REFS-WRITE-004,
     //       REFS-LOOSE-001, REFS-LOOSE-002, REFS-LOOSE-004, REFS-NAME-008
     pub fn write_ref(&self, name: &str, id: &ObjectId) -> Result<(), RefError> {
+        self.write_ref_with_reason(name, id, "ref update")
+    }
+
+    /// Write a ref and append a reflog entry with the given reason.
+    pub fn write_ref_with_reason(
+        &self,
+        name: &str,
+        id: &ObjectId,
+        reason: &str,
+    ) -> Result<(), RefError> {
         validate_ref_name(name)?;
+        let old_id = self.read_ref(name).unwrap_or(ObjectId::ZERO);
         let path = self.git_dir().join(name);
         let parent = path
             .parent()
@@ -125,7 +151,62 @@ impl Repository {
         fs::create_dir_all(parent)?;
         let contents = format!("{}\n", id.to_hex());
         atomic_write(&path, contents.as_bytes())?;
+        append_reflog(self.git_dir(), name, &old_id, id, reason)?;
+        // If HEAD is symbolic and points at `name`, the update also
+        // appears in HEAD's reflog (matches upstream git).
+        if let Ok(HeadState::Symbolic(target)) = self.read_head() {
+            if target == name {
+                append_reflog(self.git_dir(), "HEAD", &old_id, id, reason)?;
+            }
+        }
         Ok(())
+    }
+
+    /// Read the reflog for the named ref. Returns an empty vec if no
+    /// reflog file exists. Entries are returned in file order (oldest
+    /// first); callers that want newest-first should iterate in reverse.
+    pub fn read_reflog(&self, ref_name: &str) -> Result<Vec<ReflogEntry>, RefError> {
+        let log_path = self.git_dir().join("logs").join(ref_name);
+        let contents = match fs::read_to_string(&log_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(RefError::Io(e)),
+        };
+        let mut entries = Vec::new();
+        for line in contents.lines() {
+            // `<old> <new> <committer> <ts> <tz>\t<reason>`
+            // where <committer> is `Name <email>` and may contain spaces.
+            let (head, reason) = line.split_once('\t').unwrap_or((line, ""));
+            // Split head into pieces from the left: old, new, then
+            // the rest. The last two space-separated tokens are tz and ts.
+            let mut tokens: Vec<&str> = head.split(' ').collect();
+            if tokens.len() < 5 {
+                continue;
+            }
+            let old_hex = tokens.remove(0);
+            let new_hex = tokens.remove(0);
+            // Now tokens = [name..., email_with_brackets, ts, tz]
+            // Pull off tz and ts from the end.
+            let tz = tokens.pop().unwrap_or("");
+            let ts = tokens.pop().unwrap_or("0");
+            let committer = tokens.join(" ");
+            let Ok(old_id) = ObjectId::from_hex(old_hex) else {
+                continue;
+            };
+            let Ok(new_id) = ObjectId::from_hex(new_hex) else {
+                continue;
+            };
+            let timestamp: i64 = ts.parse().unwrap_or(0);
+            entries.push(ReflogEntry {
+                old_id,
+                new_id,
+                committer,
+                timestamp,
+                timezone: tz.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+        Ok(entries)
     }
 
     /// Point HEAD at a branch ref.
@@ -135,18 +216,36 @@ impl Repository {
             return Err(RefError::InvalidRefName(target.to_string()));
         }
         validate_ref_name(target)?;
+        let old_id = self.read_ref("HEAD").unwrap_or(ObjectId::ZERO);
         let path = self.git_dir().join("HEAD");
         let contents = format!("ref: {target}\n");
         atomic_write(&path, contents.as_bytes())?;
+        // Reflog: record where HEAD now points (which is the target's id).
+        let new_id = self.read_ref(target).unwrap_or(ObjectId::ZERO);
+        append_reflog(
+            self.git_dir(),
+            "HEAD",
+            &old_id,
+            &new_id,
+            &format!("checkout: moving to {target}"),
+        )?;
         Ok(())
     }
 
     /// Detach HEAD at a specific commit.
     // @spec REFS-HEAD-006
     pub fn set_head_detached(&self, id: &ObjectId) -> Result<(), RefError> {
+        let old_id = self.read_ref("HEAD").unwrap_or(ObjectId::ZERO);
         let path = self.git_dir().join("HEAD");
         let contents = format!("{}\n", id.to_hex());
         atomic_write(&path, contents.as_bytes())?;
+        append_reflog(
+            self.git_dir(),
+            "HEAD",
+            &old_id,
+            id,
+            "checkout: detached HEAD",
+        )?;
         Ok(())
     }
 
@@ -295,6 +394,46 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), RefError> {
     if let Ok(d) = fs::File::open(parent) {
         let _ = d.sync_all();
     }
+    Ok(())
+}
+
+fn append_reflog(
+    git_dir: &Path,
+    ref_name: &str,
+    old_id: &ObjectId,
+    new_id: &ObjectId,
+    reason: &str,
+) -> Result<(), RefError> {
+    use std::io::Write;
+    let log_path = git_dir.join("logs").join(ref_name);
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let name = std::env::var("GIT_AUTHOR_NAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let email = std::env::var("GIT_AUTHOR_EMAIL").unwrap_or_else(|_| format!("{name}@localhost"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let line = format!(
+        "{} {} {} <{}> {} +0000\t{}\n",
+        old_id.to_hex(),
+        new_id.to_hex(),
+        name,
+        email,
+        now,
+        reason,
+    );
+
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    f.write_all(line.as_bytes())?;
     Ok(())
 }
 
