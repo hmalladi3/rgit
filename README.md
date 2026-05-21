@@ -22,7 +22,7 @@ rgit ls-tree <ref>            list entries of a tree (or a commit's tree)
 rgit rev-parse <ref>          resolve a ref name or short id to a full SHA
 rgit cat-file [-t|-p|-s] <id> low-level object inspection
 rgit hash-object [-w] <file>  compute (and optionally store) a blob's id
-rgit push <url>               upload refs + objects via Smart HTTP
+rgit push <url>               upload refs + objects (Smart HTTP or SSH)
 ```
 
 rgit's on-disk format is byte-for-byte compatible with upstream Git. `git log`, `git ls-tree`, `git cat-file`, and `git fsck` all read rgit-produced repositories without complaint. You can hand a repo back and forth between the two.
@@ -53,10 +53,13 @@ echo "hello rgit" > README.md
 git log --oneline
 git ls-tree HEAD
 
-# Push to any Smart-HTTP host.
+# Push via HTTPS (uses a personal access token):
 export GITHUB_USERNAME=your-username
 export GITHUB_TOKEN=ghp_xxxxxxxxxxxx
 ../target/release/rgit push https://github.com/your/repo.git
+
+# Or push via SSH (uses your existing ssh-agent / ~/.ssh config):
+../target/release/rgit push git@github.com:your/repo.git
 ```
 
 ## Architecture
@@ -69,7 +72,8 @@ rgit-core/src/
 ├── refs/        branches, tags, packed-refs, HEAD; atomic writes; path-traversal-safe validation
 ├── index/       .git/index v2 codec; stat-cache fidelity so upstream git can pick up where rgit left off
 ├── workdir/     checkout, status, build-tree-from-index
-└── transport/   Smart HTTP v0 push: pkt-line, HTTP Basic auth, ref-update + pack upload
+└── transport/   push via HTTPS (pkt-line + HTTP Basic auth) and SSH
+                  (subprocess to system `ssh`, raw receive-pack over the pipe)
 rgit-cli/src/
 └── main.rs      CLI dispatch (clap-derive)
 ```
