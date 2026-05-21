@@ -10,10 +10,12 @@ Implements Git's object model, pack format, ref system, index file, and the Smar
 
 ```
 rgit init <path>              create a new repository
-rgit add <paths…>             stage files; recurses into directories
+rgit add <paths…>             stage files; recurses; honors .gitignore
 rgit commit -m <msg>          record a commit; advances HEAD's target ref
-rgit status                   working-tree vs index vs HEAD
+rgit status                   working-tree vs index vs HEAD (gitignore-filtered)
 rgit log [-n N]               walk commit history from HEAD
+rgit diff [--cached | <a> <b>]  unified diff (LCS-based; default: workdir vs index)
+rgit merge <target>           fast-forward merge (3-way merge deferred)
 rgit branch [-d] [<name>]     list / create / delete branches
 rgit checkout <ref>           switch HEAD to a branch or commit
 rgit tag [-d] [<name> [<id>]] list / create / delete tags
@@ -32,10 +34,9 @@ rgit's on-disk format is byte-for-byte compatible with upstream Git. `git log`, 
 These are deferred work, not gaps in understanding. Each is a sub-project of its own; shipping half-finished versions would be worse than shipping none:
 
 - **`clone` / `fetch`** — the v2 fetch protocol is its own implementation effort. Push uses the older v0 receive-pack, which is smaller.
-- **Merge, rebase, cherry-pick, revert, stash** — three-way merge at production quality is a multi-month subproject. A half-implemented merge is the worst possible artifact for the portfolio frame.
-- **`.gitignore`** — straightforward but bounded; `rgit status` currently surfaces every untracked file including build outputs.
+- **Three-way recursive merge, rebase, cherry-pick, revert, stash** — production-quality 3-way merge (rename detection, conflict markers, criss-cross history) is a multi-month subproject. `rgit merge` handles the fast-forward case cleanly; non-FF merges return a clear error. A half-implemented 3-way merge is the worst possible artifact for the portfolio frame.
+- **Per-directory `.gitignore` cascading** — v1 reads only the top-level `.gitignore` and `.git/info/exclude`. Nested `.gitignore` files in subdirectories are not yet consulted.
 - **Delta-encoded pack writes** — rgit emits full-object packs. The uploads are 5–10× larger than upstream's, but every server accepts them.
-- **Textual diff (`rgit diff`)** — Myers/Histogram diff is its own project.
 - **Submodules, worktrees, sparse checkout, SSH transport, Windows support** — each is a deliberate scope decision, not a missed feature.
 
 ## Quick start
@@ -72,6 +73,9 @@ rgit-core/src/
 ├── refs/        branches, tags, packed-refs, HEAD; atomic writes; path-traversal-safe validation
 ├── index/       .git/index v2 codec; stat-cache fidelity so upstream git can pick up where rgit left off
 ├── workdir/     checkout, status, build-tree-from-index
+├── gitignore/   .gitignore pattern parser + matcher (literals, *, **, ?, negation, anchoring)
+├── diff/        LCS-based line diff + unified-diff output; tree-vs-tree, index-vs-HEAD, workdir-vs-index
+├── merge/       fast-forward merge with ancestor walk; non-FF rejected (3-way deferred)
 └── transport/   push via HTTPS (pkt-line + HTTP Basic auth) and SSH
                   (subprocess to system `ssh`, raw receive-pack over the pipe)
 rgit-cli/src/

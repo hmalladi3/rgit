@@ -7,6 +7,7 @@
 //! index, working tree, transport) build on top and will be added
 //! incrementally.
 
+pub mod diff;
 pub mod gitignore;
 pub mod index;
 pub mod merge;
