@@ -9,6 +9,7 @@
 
 pub mod gitignore;
 pub mod index;
+pub mod merge;
 pub mod object;
 pub mod odb;
 pub mod pack;
