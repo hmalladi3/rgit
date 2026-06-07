@@ -8,7 +8,7 @@ edition = "2021"
 rust-version = "1.75"
 license = "MIT"
 authors = ["Hari Malladi <harimalladi@proton.me>"]
-repository = "https://github.com/harimalladi/rgit"
+repository = "https://github.com/hmalladi3/rgit"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
